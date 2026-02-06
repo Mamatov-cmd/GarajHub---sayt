@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { getAIMentorResponse } from './services/geminiService';
 import { convertToBase64, validateImageFile } from './utils/fileHelpers';
-import Logo from './r.png'
+import { db, localStorageDB } from './db';
+import Logo from './r.png';
 
 const ADMIN_EMAIL = 'mamatovo354@gmail.com';
 const ADMIN_PASS = '123@Ozod';
 const CATEGORIES = ["Fintech", "Edtech", "AI/ML", "E-commerce", "SaaS", "Blockchain", "Healthcare", "Cybersecurity", "GameDev", "Networking", "Productivity", "Other"];
 
-// --- REUSABLE UI COMPONENTS ---
+// MongoDB ishlatish yoki localStorage ishlatish (fallback)
+const USE_MONGODB = true; // true ga o'zgartirganda MongoDB ishlatiladi
 
+// --- REUSABLE UI COMPONENTS --
 const Badge = ({ children, variant = 'default', size = 'sm', className = "" }) => {
   const styles = {
     default: "bg-gray-50 border-gray-200 text-gray-600",
@@ -138,11 +141,12 @@ const EmptyState = ({ icon, title, subtitle, action }) => (
 
 const App = () => {
   // --- CORE STATE ---
-  const [allUsers, setAllUsers] = useState(() => JSON.parse(localStorage.getItem('gh_users_v8') || '[]'));
-  const [currentUser, setCurrentUser] = useState(() => JSON.parse(localStorage.getItem('gh_current_v8') || 'null'));
-  const [startups, setStartups] = useState(() => JSON.parse(localStorage.getItem('gh_startups_v8') || '[]'));
-  const [joinRequests, setJoinRequests] = useState(() => JSON.parse(localStorage.getItem('gh_requests_v8') || '[]'));
-  const [notifications, setNotifications] = useState(() => JSON.parse(localStorage.getItem('gh_notifs_v8') || '[]'));
+  const [allUsers, setAllUsers] = useState([]);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [startups, setStartups] = useState([]);
+  const [joinRequests, setJoinRequests] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [loading, setLoading] = useState(true);
 
   // --- UI STATE ---
   const [activeTab, setActiveTab] = useState('explore');
@@ -165,14 +169,71 @@ const App = () => {
 
   const chatEndRef = useRef(null);
 
-  // --- SYNC TO LOCAL STORAGE ---
+  // --- INITIAL DATA LOAD ---
   useEffect(() => {
-    localStorage.setItem('gh_users_v8', JSON.stringify(allUsers));
-    localStorage.setItem('gh_current_v8', JSON.stringify(currentUser));
-    localStorage.setItem('gh_startups_v8', JSON.stringify(startups));
-    localStorage.setItem('gh_requests_v8', JSON.stringify(joinRequests));
-    localStorage.setItem('gh_notifs_v8', JSON.stringify(notifications));
-  }, [allUsers, currentUser, startups, joinRequests, notifications]);
+    loadInitialData();
+  }, []);
+
+  const loadInitialData = async () => {
+    try {
+      setLoading(true);
+      
+      if (USE_MONGODB) {
+        // MongoDB dan ma'lumotlarni yuklash
+        const [usersData, startupsData, requestsData, notifsData] = await Promise.all([
+          db.getUsers().catch(() => []),
+          db.getStartups().catch(() => []),
+          db.getJoinRequests().catch(() => []),
+          db.getNotifications(currentUser?.id || 'all').catch(() => [])
+        ]);
+        
+        setAllUsers(usersData);
+        setStartups(startupsData);
+        setJoinRequests(requestsData);
+        setNotifications(notifsData);
+        
+        // Current user ni localStorage dan yuklash
+        const savedUser = localStorageDB.getCurrentUser();
+        if (savedUser) {
+          const updatedUser = usersData.find(u => u.id === savedUser.id) || savedUser;
+          setCurrentUser(updatedUser);
+        }
+      } else {
+        // localStorage dan yuklash (fallback)
+        setAllUsers(localStorageDB.getUsers());
+        setCurrentUser(localStorageDB.getCurrentUser());
+        setStartups(localStorageDB.getStartups());
+        setJoinRequests(localStorageDB.getRequests());
+        setNotifications(localStorageDB.getNotifications());
+      }
+    } catch (error) {
+      console.error('Ma\'lumotlarni yuklashda xatolik:', error);
+      // Fallback localStorage ga
+      setAllUsers(localStorageDB.getUsers());
+      setCurrentUser(localStorageDB.getCurrentUser());
+      setStartups(localStorageDB.getStartups());
+      setJoinRequests(localStorageDB.getRequests());
+      setNotifications(localStorageDB.getNotifications());
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- SYNC TO STORAGE ---
+  useEffect(() => {
+    if (!loading) {
+      if (USE_MONGODB) {
+        // MongoDB ga sinxronlash kerak bo'lganda
+        // Bu yerda optimistik yangilanishlar bilan ishlashingiz mumkin
+      }
+      // Har doim localStorage ga ham saqlash (backup)
+      localStorageDB.setUsers(allUsers);
+      localStorageDB.setCurrentUser(currentUser);
+      localStorageDB.setStartups(startups);
+      localStorageDB.setRequests(joinRequests);
+      localStorageDB.setNotifications(notifications);
+    }
+  }, [allUsers, currentUser, startups, joinRequests, notifications, loading]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -180,7 +241,7 @@ const App = () => {
 
   // --- HANDLERS ---
 
-  const addNotification = (userId, title, text, type = 'info') => {
+  const addNotification = async (userId, title, text, type = 'info') => {
     const n = { 
       id: `n_${Date.now()}`, 
       user_id: userId, 
@@ -190,7 +251,16 @@ const App = () => {
       is_read: false, 
       created_at: new Date().toISOString() 
     };
+    
     setNotifications(prev => [n, ...prev]);
+    
+    if (USE_MONGODB) {
+      try {
+        await db.createNotification(n);
+      } catch (error) {
+        console.error('Bildirishnoma qo\'shishda xatolik:', error);
+      }
+    }
   };
 
   const handleAuth = async (e) => {
@@ -210,17 +280,28 @@ const App = () => {
           created_at: '', 
           skills: [], 
           languages: [], 
-          tools: [] 
+          tools: [],
+          avatar: `https://ui-avatars.com/api/?name=Ozodbek+Mamatov&background=111&color=fff`
         };
         setCurrentUser(admin);
         navigateTo('admin');
       } else {
-        const u = allUsers.find(x => x.email === email);
-        if (u) { 
-          setCurrentUser(u); 
-          navigateTo('explore'); 
+        if (USE_MONGODB) {
+          try {
+            const response = await db.login(email, pass);
+            setCurrentUser(response.user);
+            navigateTo('explore');
+          } catch (error) {
+            alert('Xato ma\'lumotlar yoki serverga ulanishda muammo');
+          }
         } else {
-          alert('Xato ma\'lumotlar');
+          const u = allUsers.find(x => x.email === email);
+          if (u) { 
+            setCurrentUser(u); 
+            navigateTo('explore'); 
+          } else {
+            alert('Xato ma\'lumotlar');
+          }
         }
       }
     } else {
@@ -236,8 +317,21 @@ const App = () => {
         tools: [],
         avatar: tempFileBase64 || `https://ui-avatars.com/api/?name=${fd.get('name')}&background=111&color=fff`
       };
-      setAllUsers(prev => [...prev, u]);
-      setCurrentUser(u);
+      
+      if (USE_MONGODB) {
+        try {
+          const response = await db.register(u);
+          setAllUsers(prev => [...prev, response.user]);
+          setCurrentUser(response.user);
+        } catch (error) {
+          console.error('Ro\'yxatdan o\'tishda xatolik:', error);
+          setAllUsers(prev => [...prev, u]);
+          setCurrentUser(u);
+        }
+      } else {
+        setAllUsers(prev => [...prev, u]);
+        setCurrentUser(u);
+      }
       navigateTo('profile');
     }
     setShowAuthModal(false);
@@ -265,7 +359,7 @@ const App = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleJoinRequest = (s) => {
+  const handleJoinRequest = async (s) => {
     if (!currentUser) return setShowAuthModal(true);
     if (s.egasi_id === currentUser.id) return alert('O\'z loyihangizga qo\'shila olmaysiz.');
     if (s.a_zolar.some(m => m.user_id === currentUser.id)) return alert('Siz allaqachon jamoa a\'zosisiz.');
@@ -287,13 +381,23 @@ const App = () => {
     };
 
     setJoinRequests(prev => [req, ...prev]);
+    
+    if (USE_MONGODB) {
+      try {
+        await db.createJoinRequest(req);
+      } catch (error) {
+        console.error('So\'rov yuborishda xatolik:', error);
+      }
+    }
+    
     addNotification(s.egasi_id, 'Yangi ariza', `"${currentUser.name}" jamoangizga qo'shilmoqchi.`, 'info');
     alert('So\'rovingiz muvaffaqiyatli yuborildi!');
   };
 
-  const handleRequestAction = (id, action) => {
+  const handleRequestAction = async (id, action) => {
     const r = joinRequests.find(x => x.id === id);
     if (!r) return;
+    
     if (action === 'accept') {
       const newMember = { 
         user_id: r.user_id, 
@@ -301,20 +405,67 @@ const App = () => {
         role: r.specialty, 
         joined_at: new Date().toISOString() 
       };
-      setStartups(prev => prev.map(s => s.id === r.startup_id ? { ...s, a_zolar: [...s.a_zolar, newMember] } : s));
+      
+      const updatedStartups = startups.map(s => 
+        s.id === r.startup_id ? { ...s, a_zolar: [...s.a_zolar, newMember] } : s
+      );
+      setStartups(updatedStartups);
+      
+      if (USE_MONGODB) {
+        try {
+          await db.acceptJoinRequest(id);
+          const startup = updatedStartups.find(s => s.id === r.startup_id);
+          if (startup) {
+            await db.updateStartup(startup.id, startup);
+          }
+        } catch (error) {
+          console.error('So\'rovni qabul qilishda xatolik:', error);
+        }
+      }
+      
       addNotification(r.user_id, 'Tabriklaymiz!', `Siz "${r.startup_name}" jamoasiga qabul qilindingiz.`, 'success');
     }
+    
     setJoinRequests(prev => prev.filter(x => x.id !== id));
+    
+    if (USE_MONGODB) {
+      try {
+        await db.rejectJoinRequest(id);
+      } catch (error) {
+        console.error('So\'rovni rad etishda xatolik:', error);
+      }
+    }
   };
 
-  const handleAdminModeration = (id, action) => {
+  const handleAdminModeration = async (id, action) => {
     const reason = action === 'rejected' ? prompt('Rad etish sababi:') : undefined;
     if (action === 'rejected' && !reason) return;
 
-    setStartups(prev => prev.map(s => s.id === id ? { ...s, status: action, rejection_reason: reason } : s));
+    const updatedStartups = startups.map(s => 
+      s.id === id ? { ...s, status: action, rejection_reason: reason } : s
+    );
+    setStartups(updatedStartups);
+    
+    if (USE_MONGODB) {
+      try {
+        if (action === 'approved') {
+          await db.approveStartup(id);
+        } else {
+          await db.rejectStartup(id, reason);
+        }
+      } catch (error) {
+        console.error('Moderatsiya xatolik:', error);
+      }
+    }
+    
     const s = startups.find(x => x.id === id);
     if (s) {
-      addNotification(s.egasi_id, action === 'approved' ? 'Loyiha tasdiqlandi' : 'Loyiha rad etildi', `"${s.nomi}" loyihasi moderatsiyadan o'tdi.`, action === 'approved' ? 'success' : 'error');
+      addNotification(
+        s.egasi_id, 
+        action === 'approved' ? 'Loyiha tasdiqlandi' : 'Loyiha rad etildi', 
+        `"${s.nomi}" loyihasi moderatsiyadan o'tdi.`, 
+        action === 'approved' ? 'success' : 'error'
+      );
     }
   };
 
@@ -335,25 +486,47 @@ const App = () => {
       yaratilgan_vaqt: new Date().toISOString(),
       a_zolar: [{ user_id: currentUser.id, name: currentUser.name, role: 'Asoschi', joined_at: new Date().toISOString() }],
       tasks: [],
-      views: 0
+      views: 0,
+      github_url: fd.get('github_url') || '',
+      website_url: fd.get('website_url') || ''
     };
+    
     setStartups(prev => [s, ...prev]);
+    
+    if (USE_MONGODB) {
+      try {
+        await db.createStartup(s);
+      } catch (error) {
+        console.error('Startup yaratishda xatolik:', error);
+      }
+    }
+    
     navigateTo('my-projects');
     addNotification('admin', 'Yangi ariza', `"${s.nomi}" loyihasi moderatsiya uchun yuborildi.`);
     setTempFileBase64(null);
   };
 
-  const handleUpdateProfile = () => {
+  const handleUpdateProfile = async () => {
     if (!currentUser) return;
     const updatedUser = { ...currentUser, ...editedUser };
+    
     setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
     setCurrentUser(updatedUser);
+    
+    if (USE_MONGODB) {
+      try {
+        await db.updateUser(currentUser.id, updatedUser);
+      } catch (error) {
+        console.error('Profilni yangilashda xatolik:', error);
+      }
+    }
+    
     setIsEditProfileModalOpen(false);
     setEditedUser({});
     setTempFileBase64(null);
   };
 
-  const handleAddTask = (startupId) => {
+  const handleAddTask = async (startupId) => {
     const title = prompt('Vazifa nomi:');
     if (!title) return;
     const desc = prompt('Batafsil tavsif:');
@@ -367,14 +540,35 @@ const App = () => {
       deadline: '',
       status: 'todo'
     };
-    setStartups(prev => prev.map(s => s.id === startupId ? { ...s, tasks: [...s.tasks, newTask] } : s));
+    
+    const updatedStartups = startups.map(s => 
+      s.id === startupId ? { ...s, tasks: [...s.tasks, newTask] } : s
+    );
+    setStartups(updatedStartups);
+    
+    if (USE_MONGODB) {
+      try {
+        await db.createTask(startupId, newTask);
+      } catch (error) {
+        console.error('Vazifa qo\'shishda xatolik:', error);
+      }
+    }
   };
 
-  const handleMoveTask = (startupId, taskId, newStatus) => {
-    setStartups(prev => prev.map(s => s.id === startupId ? {
+  const handleMoveTask = async (startupId, taskId, newStatus) => {
+    const updatedStartups = startups.map(s => s.id === startupId ? {
       ...s,
       tasks: s.tasks.map(t => t.id === taskId ? { ...t, status: newStatus } : t)
-    } : s));
+    } : s);
+    setStartups(updatedStartups);
+    
+    if (USE_MONGODB) {
+      try {
+        await db.moveTask(startupId, taskId, newStatus);
+      } catch (error) {
+        console.error('Vazifa holatini o\'zgartirishda xatolik:', error);
+      }
+    }
   };
 
   const handleSendAIMessage = async () => {
@@ -942,6 +1136,17 @@ const App = () => {
       </div>
     </div>
   );
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-white">
+        <div className="text-center space-y-4">
+          <i className="fa-solid fa-spinner animate-spin text-4xl text-gray-900"></i>
+          <p className="text-[14px] font-bold text-gray-400 uppercase tracking-widest">Yuklanmoqda...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-white text-gray-900 selection:bg-black selection:text-white font-sans overflow-hidden">
