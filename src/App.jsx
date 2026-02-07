@@ -1,17 +1,14 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { getAIMentorResponse } from './services/geminiService';
 import { convertToBase64, validateImageFile } from './utils/fileHelpers';
-import { db, localStorageDB } from './db';
+import { initDatabase, dbOperations, saveDatabase } from './database';
 import Logo from './r.png';
 
 const ADMIN_EMAIL = 'mamatovo354@gmail.com';
 const ADMIN_PASS = '123@Ozod';
-const CATEGORIES = ["Fintech", "Edtech", "AI/ML", "E-commerce", "SaaS", "Blockchain", "Healthcare", "Cybersecurity", "GameDev", "Networking", "Productivity", "Other"];
+const DEFAULT_CATEGORIES = ["Fintech", "Edtech", "AI/ML", "E-commerce", "SaaS", "Blockchain", "Healthcare", "Cybersecurity", "GameDev", "Networking", "Productivity", "Other"];
 
-// MongoDB ishlatish yoki localStorage ishlatish (fallback)
-const USE_MONGODB = true; // true ga o'zgartirganda MongoDB ishlatiladi
-
-// --- REUSABLE UI COMPONENTS --
+// --- REUSABLE UI COMPONENTS ---
 const Badge = ({ children, variant = 'default', size = 'sm', className = "" }) => {
   const styles = {
     default: "bg-gray-50 border-gray-200 text-gray-600",
@@ -161,6 +158,10 @@ const App = () => {
   const [aiInput, setAiInput] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [activeDetailTab, setActiveDetailTab] = useState('vazifalar');
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
+  const [adminTab, setAdminTab] = useState('moderation');
+  const [adminStats, setAdminStats] = useState(null);
+  const [auditLogs, setAuditLogs] = useState([]);
   
   // Modals & Edit States
   const [isEditProfileModalOpen, setIsEditProfileModalOpen] = useState(false);
@@ -174,70 +175,71 @@ const App = () => {
     loadInitialData();
   }, []);
 
+  const openAuth = (mode = 'login') => {
+    setAuthMode(mode);
+    setShowAuthModal(true);
+  };
+
   const loadInitialData = async () => {
     try {
       setLoading(true);
       
-      if (USE_MONGODB) {
-        // MongoDB dan ma'lumotlarni yuklash
-        const [usersData, startupsData, requestsData, notifsData] = await Promise.all([
-          db.getUsers().catch(() => []),
-          db.getStartups().catch(() => []),
-          db.getJoinRequests().catch(() => []),
-          db.getNotifications(currentUser?.id || 'all').catch(() => [])
-        ]);
-        
-        setAllUsers(usersData);
-        setStartups(startupsData);
-        setJoinRequests(requestsData);
-        setNotifications(notifsData);
-        
-        // Current user ni localStorage dan yuklash
-        const savedUser = localStorageDB.getCurrentUser();
-        if (savedUser) {
-          const updatedUser = usersData.find(u => u.id === savedUser.id) || savedUser;
-          setCurrentUser(updatedUser);
+      // Initialize database
+      await initDatabase();
+      
+      // Load data from SQLite
+      const [usersData, startupsData, requestsData] = await Promise.all([
+        dbOperations.getUsers(),
+        dbOperations.getStartups(),
+        dbOperations.getJoinRequests()
+      ]);
+
+      try {
+        const cats = await dbOperations.getCategories();
+        if (Array.isArray(cats) && cats.length > 0) {
+          setCategories(cats.map(c => c.name));
         }
-      } else {
-        // localStorage dan yuklash (fallback)
-        setAllUsers(localStorageDB.getUsers());
-        setCurrentUser(localStorageDB.getCurrentUser());
-        setStartups(localStorageDB.getStartups());
-        setJoinRequests(localStorageDB.getRequests());
-        setNotifications(localStorageDB.getNotifications());
+      } catch (e) {
+        setCategories(DEFAULT_CATEGORIES);
+      }
+      
+      setAllUsers(usersData);
+      setStartups(startupsData);
+      setJoinRequests(requestsData);
+      
+      // Load current user from localStorage
+      const savedUserId = localStorage.getItem('currentUserId');
+      if (savedUserId) {
+        const user = await dbOperations.getUserById(savedUserId);
+        if (user) {
+          setCurrentUser(user);
+          const userNotifs = await dbOperations.getNotifications(user.id);
+          setNotifications(userNotifs);
+        }
+      }
+      if (!savedUserId) {
+        const alreadyPrompted = sessionStorage.getItem('authPromptShown');
+        if (!alreadyPrompted) {
+          openAuth('login');
+          sessionStorage.setItem('authPromptShown', '1');
+        }
       }
     } catch (error) {
       console.error('Ma\'lumotlarni yuklashda xatolik:', error);
-      // Fallback localStorage ga
-      setAllUsers(localStorageDB.getUsers());
-      setCurrentUser(localStorageDB.getCurrentUser());
-      setStartups(localStorageDB.getStartups());
-      setJoinRequests(localStorageDB.getRequests());
-      setNotifications(localStorageDB.getNotifications());
     } finally {
       setLoading(false);
     }
   };
 
-  // --- SYNC TO STORAGE ---
-  useEffect(() => {
-    if (!loading) {
-      if (USE_MONGODB) {
-        // MongoDB ga sinxronlash kerak bo'lganda
-        // Bu yerda optimistik yangilanishlar bilan ishlashingiz mumkin
-      }
-      // Har doim localStorage ga ham saqlash (backup)
-      localStorageDB.setUsers(allUsers);
-      localStorageDB.setCurrentUser(currentUser);
-      localStorageDB.setStartups(startups);
-      localStorageDB.setRequests(joinRequests);
-      localStorageDB.setNotifications(notifications);
-    }
-  }, [allUsers, currentUser, startups, joinRequests, notifications, loading]);
-
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [aiChat]);
+
+  useEffect(() => {
+    if (activeTab === 'admin' && currentUser?.role === 'admin') {
+      refreshAdminData();
+    }
+  }, [activeTab, currentUser, adminTab]);
 
   // --- HANDLERS ---
 
@@ -252,14 +254,27 @@ const App = () => {
       created_at: new Date().toISOString() 
     };
     
-    setNotifications(prev => [n, ...prev]);
+    await dbOperations.createNotification(n);
     
-    if (USE_MONGODB) {
-      try {
-        await db.createNotification(n);
-      } catch (error) {
-        console.error('Bildirishnoma qo\'shishda xatolik:', error);
+    if (currentUser && (userId === currentUser.id || userId === 'admin')) {
+      setNotifications(prev => [n, ...prev]);
+    }
+  };
+
+  const refreshAdminData = async () => {
+    try {
+      const [stats, logs, cats] = await Promise.all([
+        dbOperations.getStats(),
+        dbOperations.getAuditLogs(80),
+        dbOperations.getCategories()
+      ]);
+      setAdminStats(stats);
+      setAuditLogs(logs || []);
+      if (Array.isArray(cats) && cats.length > 0) {
+        setCategories(cats.map(c => c.name));
       }
+    } catch (e) {
+      console.error('Admin ma\'lumotlarini yuklashda xatolik:', e);
     }
   };
 
@@ -277,61 +292,57 @@ const App = () => {
           name: 'Ozodbek Mamatov', 
           phone: '+998932303410', 
           role: 'admin', 
-          created_at: '', 
+          created_at: new Date().toISOString(), 
           skills: [], 
           languages: [], 
           tools: [],
           avatar: `https://ui-avatars.com/api/?name=Ozodbek+Mamatov&background=111&color=fff`
         };
         setCurrentUser(admin);
+        localStorage.setItem('currentUserId', 'admin');
         navigateTo('admin');
       } else {
-        if (USE_MONGODB) {
-          try {
-            const response = await db.login(email, pass);
-            setCurrentUser(response.user);
-            navigateTo('explore');
-          } catch (error) {
-            alert('Xato ma\'lumotlar yoki serverga ulanishda muammo');
-          }
+        const user = await dbOperations.getUserByEmail(email);
+        if (user && user.banned) {
+          alert('Sizning profilingiz vaqtincha bloklangan.');
+          return;
+        }
+        if (user && user.password === pass) { 
+          setCurrentUser(user);
+          localStorage.setItem('currentUserId', user.id);
+          const userNotifs = await dbOperations.getNotifications(user.id);
+          setNotifications(userNotifs);
+          navigateTo('explore'); 
         } else {
-          const u = allUsers.find(x => x.email === email);
-          if (u) { 
-            setCurrentUser(u); 
-            navigateTo('explore'); 
-          } else {
-            alert('Xato ma\'lumotlar');
-          }
+          alert('Xato email yoki parol');
         }
       }
     } else {
+      // Register
+      const existingUser = await dbOperations.getUserByEmail(email);
+      if (existingUser) {
+        alert('Bu email allaqachon ro\'yxatdan o\'tgan');
+        return;
+      }
+
       const u = { 
         id: `u_${Date.now()}`, 
         email, 
+        password: pass,
         name: fd.get('name'), 
-        phone: fd.get('phone'), 
+        phone: fd.get('phone') || '', 
         role: 'user', 
         created_at: new Date().toISOString(), 
         skills: [], 
         languages: [], 
         tools: [],
-        avatar: tempFileBase64 || `https://ui-avatars.com/api/?name=${fd.get('name')}&background=111&color=fff`
+        avatar: tempFileBase64 || `https://ui-avatars.com/api/?name=${encodeURIComponent(fd.get('name'))}&background=111&color=fff`
       };
       
-      if (USE_MONGODB) {
-        try {
-          const response = await db.register(u);
-          setAllUsers(prev => [...prev, response.user]);
-          setCurrentUser(response.user);
-        } catch (error) {
-          console.error('Ro\'yxatdan o\'tishda xatolik:', error);
-          setAllUsers(prev => [...prev, u]);
-          setCurrentUser(u);
-        }
-      } else {
-        setAllUsers(prev => [...prev, u]);
-        setCurrentUser(u);
-      }
+      await dbOperations.createUser(u);
+      setAllUsers(prev => [...prev, u]);
+      setCurrentUser(u);
+      localStorage.setItem('currentUserId', u.id);
       navigateTo('profile');
     }
     setShowAuthModal(false);
@@ -360,7 +371,7 @@ const App = () => {
   };
 
   const handleJoinRequest = async (s) => {
-    if (!currentUser) return setShowAuthModal(true);
+    if (!currentUser) return openAuth('login');
     if (s.egasi_id === currentUser.id) return alert('O\'z loyihangizga qo\'shila olmaysiz.');
     if (s.a_zolar.some(m => m.user_id === currentUser.id)) return alert('Siz allaqachon jamoa a\'zosisiz.');
     
@@ -380,17 +391,10 @@ const App = () => {
       created_at: new Date().toISOString()
     };
 
+    await dbOperations.createJoinRequest(req);
     setJoinRequests(prev => [req, ...prev]);
     
-    if (USE_MONGODB) {
-      try {
-        await db.createJoinRequest(req);
-      } catch (error) {
-        console.error('So\'rov yuborishda xatolik:', error);
-      }
-    }
-    
-    addNotification(s.egasi_id, 'Yangi ariza', `"${currentUser.name}" jamoangizga qo'shilmoqchi.`, 'info');
+    await addNotification(s.egasi_id, 'Yangi ariza', `"${currentUser.name}" jamoangizga qo'shilmoqchi.`, 'info');
     alert('So\'rovingiz muvaffaqiyatli yuborildi!');
   };
 
@@ -399,6 +403,9 @@ const App = () => {
     if (!r) return;
     
     if (action === 'accept') {
+      const startup = startups.find(s => s.id === r.startup_id);
+      if (!startup) return;
+
       const newMember = { 
         user_id: r.user_id, 
         name: r.user_name, 
@@ -406,66 +413,139 @@ const App = () => {
         joined_at: new Date().toISOString() 
       };
       
-      const updatedStartups = startups.map(s => 
-        s.id === r.startup_id ? { ...s, a_zolar: [...s.a_zolar, newMember] } : s
-      );
-      setStartups(updatedStartups);
+      const updatedAZolar = [...startup.a_zolar, newMember];
       
-      if (USE_MONGODB) {
-        try {
-          await db.acceptJoinRequest(id);
-          const startup = updatedStartups.find(s => s.id === r.startup_id);
-          if (startup) {
-            await db.updateStartup(startup.id, startup);
-          }
-        } catch (error) {
-          console.error('So\'rovni qabul qilishda xatolik:', error);
-        }
-      }
+      await dbOperations.updateStartup(r.startup_id, { a_zolar: updatedAZolar });
       
-      addNotification(r.user_id, 'Tabriklaymiz!', `Siz "${r.startup_name}" jamoasiga qabul qilindingiz.`, 'success');
+      setStartups(prev => prev.map(s => 
+        s.id === r.startup_id ? { ...s, a_zolar: updatedAZolar } : s
+      ));
+      
+      await addNotification(r.user_id, 'Tabriklaymiz!', `Siz "${r.startup_name}" jamoasiga qabul qilindingiz.`, 'success');
     }
     
+    await dbOperations.deleteRequest(id);
     setJoinRequests(prev => prev.filter(x => x.id !== id));
-    
-    if (USE_MONGODB) {
-      try {
-        await db.rejectJoinRequest(id);
-      } catch (error) {
-        console.error('So\'rovni rad etishda xatolik:', error);
-      }
-    }
   };
 
   const handleAdminModeration = async (id, action) => {
     const reason = action === 'rejected' ? prompt('Rad etish sababi:') : undefined;
     if (action === 'rejected' && !reason) return;
 
-    const updatedStartups = startups.map(s => 
-      s.id === id ? { ...s, status: action, rejection_reason: reason } : s
-    );
-    setStartups(updatedStartups);
+    await dbOperations.updateStartup(id, { 
+      status: action, 
+      rejection_reason: reason 
+    });
     
-    if (USE_MONGODB) {
-      try {
-        if (action === 'approved') {
-          await db.approveStartup(id);
-        } else {
-          await db.rejectStartup(id, reason);
-        }
-      } catch (error) {
-        console.error('Moderatsiya xatolik:', error);
-      }
-    }
+    setStartups(prev => prev.map(s => 
+      s.id === id ? { ...s, status: action, rejection_reason: reason } : s
+    ));
     
     const s = startups.find(x => x.id === id);
     if (s) {
-      addNotification(
+      await addNotification(
         s.egasi_id, 
         action === 'approved' ? 'Loyiha tasdiqlandi' : 'Loyiha rad etildi', 
-        `"${s.nomi}" loyihasi moderatsiyadan o'tdi.`, 
-        action === 'approved' ? 'success' : 'error'
+        action === 'approved' 
+          ? `"${s.nomi}" loyihasi tasdiqlandi va platformada ko'rinadi.` 
+          : `"${s.nomi}" loyihasi rad etildi. Sabab: ${reason}`, 
+        action === 'approved' ? 'success' : 'danger'
       );
+    }
+  };
+
+  const handleAdminUserRole = async (userId, role) => {
+    try {
+      const updated = await dbOperations.updateUserRole(userId, role, currentUser?.id);
+      setAllUsers(prev => prev.map(u => u.id === userId ? updated : u));
+      await refreshAdminData();
+    } catch (e) {
+      alert('Rolni o\'zgartirishda xatolik');
+    }
+  };
+
+  const handleAdminUserBan = async (userId, banned) => {
+    try {
+      const updated = await dbOperations.setUserBanned(userId, banned, currentUser?.id);
+      setAllUsers(prev => prev.map(u => u.id === userId ? updated : u));
+      await refreshAdminData();
+    } catch (e) {
+      alert('Bloklashda xatolik');
+    }
+  };
+
+  const handleAdminUserDelete = async (userId) => {
+    if (!confirm('Foydalanuvchini o\'chirmoqchimisiz?')) return;
+    try {
+      await dbOperations.deleteUser(userId, currentUser?.id);
+      setAllUsers(prev => prev.filter(u => u.id !== userId));
+      await refreshAdminData();
+    } catch (e) {
+      alert('O\'chirishda xatolik');
+    }
+  };
+
+  const handleAdminStartupStatus = async (startupId, status) => {
+    const reason = status === 'rejected' ? prompt('Rad etish sababi:') : null;
+    if (status === 'rejected' && !reason) return;
+    try {
+      const updated = await dbOperations.updateStartupStatus(startupId, status, reason, currentUser?.id);
+      setStartups(prev => prev.map(s => s.id === startupId ? updated : s));
+      if (status === 'approved' || status === 'rejected') {
+        const s = startups.find(x => x.id === startupId);
+        if (s) {
+          await addNotification(
+            s.egasi_id,
+            status === 'approved' ? 'Loyiha tasdiqlandi' : 'Loyiha rad etildi',
+            status === 'approved'
+              ? `"${s.nomi}" loyihasi tasdiqlandi va platformada ko'rinadi.`
+              : `"${s.nomi}" loyihasi rad etildi. Sabab: ${reason}`,
+            status === 'approved' ? 'success' : 'danger'
+          );
+        }
+      }
+      await refreshAdminData();
+    } catch (e) {
+      alert('Statusni o\'zgartirishda xatolik');
+    }
+  };
+
+  const handleAdminStartupDelete = async (startupId) => {
+    if (!confirm('Loyihani o\'chirmoqchimisiz?')) return;
+    try {
+      await dbOperations.deleteStartup(startupId, currentUser?.id);
+      setStartups(prev => prev.filter(s => s.id !== startupId));
+      await refreshAdminData();
+    } catch (e) {
+      alert('Loyihani o\'chirishda xatolik');
+    }
+  };
+
+  const handleAddCategory = async () => {
+    const name = prompt('Yangi kategoriya nomi:');
+    if (!name) return;
+    try {
+      await dbOperations.createCategory(name, currentUser?.id);
+      const cats = await dbOperations.getCategories();
+      setCategories(cats.map(c => c.name));
+      await refreshAdminData();
+    } catch (e) {
+      alert('Kategoriya qo\'shishda xatolik');
+    }
+  };
+
+  const handleDeleteCategory = async (categoryName) => {
+    if (!confirm(`"${categoryName}" kategoriyasini o'chirmoqchimisiz?`)) return;
+    try {
+      const cats = await dbOperations.getCategories();
+      const cat = cats.find(c => c.name === categoryName);
+      if (!cat) return;
+      await dbOperations.deleteCategory(cat.id, currentUser?.id);
+      const next = await dbOperations.getCategories();
+      setCategories(next.map(c => c.name));
+      await refreshAdminData();
+    } catch (e) {
+      alert('Kategoriya o\'chirishda xatolik');
     }
   };
 
@@ -491,84 +571,101 @@ const App = () => {
       website_url: fd.get('website_url') || ''
     };
     
+    await dbOperations.createStartup(s);
     setStartups(prev => [s, ...prev]);
     
-    if (USE_MONGODB) {
-      try {
-        await db.createStartup(s);
-      } catch (error) {
-        console.error('Startup yaratishda xatolik:', error);
-      }
-    }
-    
     navigateTo('my-projects');
-    addNotification('admin', 'Yangi ariza', `"${s.nomi}" loyihasi moderatsiya uchun yuborildi.`);
+    await addNotification('admin', 'Yangi ariza', `"${s.nomi}" loyihasi moderatsiya uchun yuborildi.`, 'info');
     setTempFileBase64(null);
+    alert('Loyiha muvaffaqiyatli yaratildi! Moderatsiyadan o\'tishini kuting.');
   };
 
   const handleUpdateProfile = async () => {
     if (!currentUser) return;
     const updatedUser = { ...currentUser, ...editedUser };
     
+    await dbOperations.updateUser(currentUser.id, updatedUser);
+    
     setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
     setCurrentUser(updatedUser);
-    
-    if (USE_MONGODB) {
-      try {
-        await db.updateUser(currentUser.id, updatedUser);
-      } catch (error) {
-        console.error('Profilni yangilashda xatolik:', error);
-      }
-    }
     
     setIsEditProfileModalOpen(false);
     setEditedUser({});
     setTempFileBase64(null);
+    alert('Profil muvaffaqiyatli yangilandi!');
   };
 
   const handleAddTask = async (startupId) => {
     const title = prompt('Vazifa nomi:');
     if (!title) return;
     const desc = prompt('Batafsil tavsif:');
+    const deadline = prompt('Deadline (YYYY-MM-DD):');
+    
     const newTask = {
       id: `t_${Date.now()}`,
       startup_id: startupId,
       title,
       description: desc || '',
       assigned_to_id: currentUser?.id || '',
-      assigned_to_name: currentUser?.name || 'Inson',
-      deadline: '',
+      assigned_to_name: currentUser?.name || 'Belgilanmagan',
+      deadline: deadline || '',
       status: 'todo'
     };
     
-    const updatedStartups = startups.map(s => 
-      s.id === startupId ? { ...s, tasks: [...s.tasks, newTask] } : s
-    );
-    setStartups(updatedStartups);
+    await dbOperations.createTask(newTask);
     
-    if (USE_MONGODB) {
-      try {
-        await db.createTask(startupId, newTask);
-      } catch (error) {
-        console.error('Vazifa qo\'shishda xatolik:', error);
-      }
-    }
+    const startup = startups.find(s => s.id === startupId);
+    const updatedTasks = [...(startup?.tasks || []), newTask];
+    
+    await dbOperations.updateStartup(startupId, { tasks: updatedTasks });
+    
+    setStartups(prev => prev.map(s => 
+      s.id === startupId ? { ...s, tasks: updatedTasks } : s
+    ));
+    
+    alert('Vazifa muvaffaqiyatli qo\'shildi!');
   };
 
   const handleMoveTask = async (startupId, taskId, newStatus) => {
-    const updatedStartups = startups.map(s => s.id === startupId ? {
+    await dbOperations.updateTaskStatus(taskId, newStatus);
+    
+    setStartups(prev => prev.map(s => s.id === startupId ? {
       ...s,
       tasks: s.tasks.map(t => t.id === taskId ? { ...t, status: newStatus } : t)
-    } : s);
-    setStartups(updatedStartups);
+    } : s));
     
-    if (USE_MONGODB) {
-      try {
-        await db.moveTask(startupId, taskId, newStatus);
-      } catch (error) {
-        console.error('Vazifa holatini o\'zgartirishda xatolik:', error);
-      }
+    const startup = startups.find(s => s.id === startupId);
+    if (startup) {
+      const updatedTasks = startup.tasks.map(t => t.id === taskId ? { ...t, status: newStatus } : t);
+      await dbOperations.updateStartup(startupId, { tasks: updatedTasks });
     }
+  };
+
+  const handleDeleteTask = async (startupId, taskId) => {
+    if (!confirm('Vazifani o\'chirmoqchimisiz?')) return;
+    
+    await dbOperations.deleteTask(taskId);
+    
+    const startup = startups.find(s => s.id === startupId);
+    if (startup) {
+      const updatedTasks = startup.tasks.filter(t => t.id !== taskId);
+      await dbOperations.updateStartup(startupId, { tasks: updatedTasks });
+      
+      setStartups(prev => prev.map(s => 
+        s.id === startupId ? { ...s, tasks: updatedTasks } : s
+      ));
+    }
+    
+    alert('Vazifa o\'chirildi!');
+  };
+
+  const handleDeleteStartup = async (startupId) => {
+    if (!confirm('Loyihani butunlay o\'chirmoqchimisiz? Bu harakatni qaytarib bo\'lmaydi!')) return;
+    
+    await dbOperations.deleteStartup(startupId);
+    setStartups(prev => prev.filter(s => s.id !== startupId));
+    navigateTo('my-projects');
+    alert('Loyiha o\'chirildi!');
   };
 
   const handleSendAIMessage = async () => {
@@ -599,14 +696,33 @@ const App = () => {
     } catch (e) {
       const errMsg = { 
         id: 'err', 
-        text: "Hozirda AI bilan bog'lana olmayapman.", 
+        text: "Hozirda AI bilan bog'lana olmayapman. Gemini API kalitini tekshiring.", 
         sender: 'ai', 
-        timestamp: '' 
+        timestamp: new Date().toISOString() 
       };
       setAiChat(prev => [...prev, errMsg]);
     } finally {
       setAiLoading(false);
     }
+  };
+
+  const handleLogout = () => {
+    setCurrentUser(null);
+    localStorage.removeItem('currentUserId');
+    navigateTo('explore');
+    alert('Tizimdan muvaffaqiyatli chiqdingiz!');
+  };
+
+  const handleMarkAllAsRead = async () => {
+    if (!currentUser) return;
+    
+    await dbOperations.markAllNotificationsAsRead(currentUser.id);
+    setNotifications(prev => prev.map(n => ({ ...n, is_read: true })));
+  };
+
+  const handleMarkAsRead = async (notifId) => {
+    await dbOperations.markNotificationAsRead(notifId);
+    setNotifications(prev => prev.map(n => n.id === notifId ? { ...n, is_read: true } : n));
   };
 
   // --- FILTERS ---
@@ -645,7 +761,7 @@ const App = () => {
       <aside className={`fixed lg:relative z-[90] w-[260px] md:w-[240px] h-full bg-white border-r border-gray-100 flex flex-col p-6 md:p-8 transition-transform duration-300 ease-in-out ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}>
         <div className="flex items-center justify-between mb-10">
           <div className="flex items-center gap-3 cursor-pointer group" onClick={() => navigateTo('explore')}>
-            <div className="w-10 h-10  flex items-center justify-center transition-transform"><img src={Logo} alt="" /></div>
+            <div className="w-10 h-10 flex items-center justify-center transition-transform"><img src={Logo} alt="Logo" /></div>
             <span className="text-[18px] font-extrabold tracking-tighter text-gray-900">GarajHub</span>
           </div>
           <button onClick={() => setIsMobileMenuOpen(false)} className="lg:hidden text-gray-400 p-2"><i className="fa-solid fa-xmark text-lg"></i></button>
@@ -653,9 +769,9 @@ const App = () => {
 
         <nav className="flex-grow space-y-1 overflow-y-auto custom-scrollbar pr-2">
           <NavItem active={activeTab === 'explore'} onClick={() => navigateTo('explore')} label="Kashfiyot" icon="fa-compass" />
-          <NavItem active={activeTab === 'my-projects'} onClick={() => navigateTo('my-projects')} label="Loyihalarim" icon="fa-rocket" />
-          <NavItem active={activeTab === 'requests'} onClick={() => navigateTo('requests')} label="So'rovlar" icon="fa-user-group" badge={incomingRequests.length} />
-          <NavItem active={activeTab === 'profile'} onClick={() => navigateTo('profile')} label="Profil" icon="fa-user" />
+          {currentUser && <NavItem active={activeTab === 'my-projects'} onClick={() => navigateTo('my-projects')} label="Loyihalarim" icon="fa-rocket" />}
+          {currentUser && <NavItem active={activeTab === 'requests'} onClick={() => navigateTo('requests')} label="So'rovlar" icon="fa-user-group" badge={incomingRequests.length} />}
+          {currentUser && <NavItem active={activeTab === 'profile'} onClick={() => navigateTo('profile')} label="Profil" icon="fa-user" />}
           {currentUser?.role === 'admin' && (
             <div className="pt-8">
               <p className="text-[11px] font-bold text-gray-400 uppercase tracking-widest px-4 mb-3">Moderatsiya</p>
@@ -672,12 +788,12 @@ const App = () => {
                 <p className="text-[13px] font-bold text-gray-900 truncate">{currentUser.name}</p>
                 <p className="text-[11px] text-gray-400 truncate">{currentUser.email}</p>
               </div>
-              <button onClick={() => {setCurrentUser(null); navigateTo('explore');}} className="text-gray-300 hover:text-rose-600 transition-colors shrink-0 p-1">
+              <button onClick={handleLogout} className="text-gray-300 hover:text-rose-600 transition-colors shrink-0 p-1">
                 <i className="fa-solid fa-power-off text-sm"></i>
               </button>
             </div>
           ) : (
-            <Button onClick={() => setShowAuthModal(true)} className="w-full">Tizimga kirish</Button>
+            <Button onClick={() => openAuth('register')} className="w-full">Tizimga kirish</Button>
           )}
         </div>
       </aside>
@@ -706,7 +822,7 @@ const App = () => {
           <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">Innovatsiyalarni kashf eting</h1>
           <p className="text-gray-500 text-[14px] md:text-[15px]">O'zbekistondagi eng yaxshi startuplar va jamoalar.</p>
         </div>
-        <Button onClick={() => navigateTo('create')} icon="fa-plus" className="w-full md:w-auto h-12 md:h-10">Loyiha Yaratish</Button>
+        {currentUser && <Button onClick={() => navigateTo('create')} icon="fa-plus" className="w-full md:w-auto h-12 md:h-10">Loyiha Yaratish</Button>}
       </header>
 
       <div className="flex flex-col gap-6">
@@ -718,7 +834,7 @@ const App = () => {
           />
         </div>
         <div className="flex items-center gap-2 overflow-x-auto no-scrollbar -mx-4 px-4 pb-2 md:mx-0 md:px-0">
-          {['All', ...CATEGORIES].map(c => (
+          {['All', ...categories].map(c => (
             <button 
               key={c} onClick={() => setSelectedCategory(c)} 
               className={`h-8 px-4 rounded-full text-[12px] font-semibold border transition-all whitespace-nowrap ${selectedCategory === c ? 'bg-black border-black text-white' : 'bg-white border-gray-200 text-gray-600 hover:border-black'}`}
@@ -731,7 +847,7 @@ const App = () => {
 
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
         {filtered.map(s => (
-          <div key={s.id} className="bg-white border border-gray-100 rounded-xl p-5 md:p-6 flex flex-col hover:border-black hover:shadow-lg transition-all group relative overflow-hidden">
+          <div key={s.id} onClick={() => navigateTo('details', s.id)} className="bg-white border border-gray-100 rounded-xl p-5 md:p-6 flex flex-col hover:border-black hover:shadow-lg transition-all group relative overflow-hidden cursor-pointer">
             <div className="flex items-start justify-between mb-4 md:mb-6">
               <img src={s.logo} className="w-12 h-12 md:w-14 md:h-14 bg-gray-50 object-cover rounded-lg border border-gray-100 shadow-sm" alt="Logo" />
               <Badge>{s.category}</Badge>
@@ -753,7 +869,7 @@ const App = () => {
                   </div>
                 )}
               </div>
-              <Button onClick={() => handleJoinRequest(s)} variant="secondary" size="sm">Qo'shilish</Button>
+              <Button onClick={(e) => { e.stopPropagation(); handleJoinRequest(s); }} variant="secondary" size="sm">Qo'shilish</Button>
             </div>
           </div>
         ))}
@@ -767,91 +883,105 @@ const App = () => {
     </div>
   );
 
-  const renderCreateStartup = () => (
-    <div className="max-w-[600px] mx-auto animate-in slide-up">
-      <div className="flex items-center gap-4 mb-8 md:mb-10">
-        <button onClick={() => navigateTo('explore')} className="text-gray-400 hover:text-black transition-colors p-2"><i className="fa-solid fa-arrow-left text-lg"></i></button>
-        <h1 className="text-xl md:text-2xl font-extrabold italic tracking-tight">Yangi startup yaratish</h1>
-      </div>
+  const renderCreateStartup = () => {
+    if (!currentUser) {
+      return <EmptyState icon="fa-lock" title="Kirish talab qilinadi" subtitle="Startup yaratish uchun tizimga kiring" action={<Button onClick={() => openAuth('login')}>Kirish</Button>} />;
+    }
 
-      <form onSubmit={handleCreateStartup} className="bg-white border border-gray-200 rounded-2xl p-6 md:p-8 space-y-6 md:space-y-8 shadow-md">
-        <FileUpload label="Startup Logosi" onChange={handleFileChange} preview={tempFileBase64 || undefined} />
-        
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 md:gap-6">
-          <Input required name="nomi" label="Startup Nomi" placeholder="Rocket.io" icon="fa-rocket" />
-          <div className="space-y-1.5 w-full">
-            <label className="block text-[11px] font-bold text-gray-700 uppercase tracking-widest ml-1">Kategoriya</label>
-            <select name="category" className="w-full h-[44px] bg-white border border-gray-200 rounded-lg px-4 text-[14px] outline-none focus:border-black shadow-sm">
-              {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
-            </select>
-          </div>
+    return (
+      <div className="max-w-[600px] mx-auto animate-in slide-up">
+        <div className="flex items-center gap-4 mb-8 md:mb-10">
+          <button onClick={() => navigateTo('explore')} className="text-gray-400 hover:text-black transition-colors p-2"><i className="fa-solid fa-arrow-left text-lg"></i></button>
+          <h1 className="text-xl md:text-2xl font-extrabold italic tracking-tight">Yangi startup yaratish</h1>
         </div>
 
-        <TextArea required name="tavsif" label="Tavsif" placeholder="Startupingizning asosiy maqsadi..." />
-        
-        <Input required name="specialists" label="Kerakli Mutaxassislar" helper="Vergul bilan ajrating" placeholder="Frontend, UI/UX Designer" icon="fa-users" />
-        
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5 md:gap-6">
-          <Input name="github_url" label="GitHub" placeholder="https://github.com/..." icon="fa-github" />
-          <Input name="website_url" label="Website" placeholder="https://..." icon="fa-globe" />
-        </div>
-
-        <div className="flex flex-col sm:flex-row gap-3 md:gap-4 pt-6 border-t border-gray-50">
-          <Button onClick={() => navigateTo('explore')} variant="secondary" className="w-full">Bekor qilish</Button>
-          <Button type="submit" className="w-full">Arizani Yuborish</Button>
-        </div>
-      </form>
-    </div>
-  );
-
-  const renderMyProjects = () => (
-    <div className="space-y-8 md:space-y-12 animate-in fade-in">
-      <header className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-        <div className="flex items-center gap-4">
-          <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">Loyihalarim</h1>
-          <Badge variant="active" size="md">{myStartups.length}</Badge>
-        </div>
-        <Button onClick={() => navigateTo('create')} icon="fa-plus" className="w-full md:w-auto h-12 md:h-10">Yangi Loyiha</Button>
-      </header>
-
-      {myStartups.length > 0 ? (
-        <div className="space-y-4">
-          {myStartups.map(s => (
-            <div key={s.id} className="bg-white border border-gray-100 rounded-xl p-5 md:p-6 flex flex-col md:flex-row items-center gap-5 md:gap-6 hover:shadow-md transition-all">
-              <img src={s.logo} className="w-16 h-16 rounded-lg object-cover border border-gray-100" alt="Logo" />
-              <div className="flex-grow min-w-0 text-center md:text-left">
-                <div className="flex items-center justify-center md:justify-start gap-3 mb-1">
-                  <h3 className="text-base md:text-lg font-bold truncate">{s.nomi}</h3>
-                  <Badge variant={s.status === 'approved' ? 'success' : s.status === 'pending_admin' ? 'default' : 'danger'}>
-                    {s.status === 'pending_admin' ? 'Moderatsiyada' : s.status === 'approved' ? 'Faol' : 'Rad etilgan'}
-                  </Badge>
-                </div>
-                <div className="flex flex-wrap justify-center md:justify-start gap-3 md:gap-4 text-[10px] md:text-[11px] font-bold text-gray-400 uppercase tracking-widest">
-                  <span>{s.category}</span>
-                  <span><i className="fa-solid fa-users mr-1"></i> {s.a_zolar.length} builder</span>
-                  <span><i className="fa-solid fa-tasks mr-1"></i> {s.tasks.length} vazifa</span>
-                </div>
-              </div>
-              <div className="flex gap-2 shrink-0 w-full md:w-auto">
-                <Button variant="secondary" size="md" onClick={() => navigateTo('details', s.id)} className="flex-grow md:flex-none h-12 md:h-10">Boshqarish</Button>
-                <Button variant="ghost" size="sm" icon="fa-gear" className="shrink-0 p-2" />
-              </div>
+        <form onSubmit={handleCreateStartup} className="bg-white border border-gray-200 rounded-2xl p-6 md:p-8 space-y-6 md:space-y-8 shadow-md">
+          <FileUpload label="Startup Logosi" onChange={handleFileChange} preview={tempFileBase64 || undefined} />
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 md:gap-6">
+            <Input required name="nomi" label="Startup Nomi" placeholder="Rocket.io" icon="fa-rocket" />
+            <div className="space-y-1.5 w-full">
+              <label className="block text-[11px] font-bold text-gray-700 uppercase tracking-widest ml-1">Kategoriya</label>
+              <select name="category" className="w-full h-[44px] bg-white border border-gray-200 rounded-lg px-4 text-[14px] outline-none focus:border-black shadow-sm">
+                {categories.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
             </div>
-          ))}
-        </div>
-      ) : (
-        <EmptyState 
-          icon="fa-rocket-launch" 
-          title="Hali loyihalar yo'q" 
-          subtitle="G'oyangiz bormi? Uni hozir platformada e'lon qiling." 
-          action={<Button onClick={() => navigateTo('create')}>Loyiha Yaratish</Button>}
-        />
-      )}
-    </div>
-  );
+          </div>
+
+          <TextArea required name="tavsif" label="Tavsif" placeholder="Startupingizning asosiy maqsadi..." />
+          
+          <Input required name="specialists" label="Kerakli Mutaxassislar" helper="Vergul bilan ajrating" placeholder="Frontend, UI/UX Designer" icon="fa-users" />
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 md:gap-6">
+            <Input name="github_url" label="GitHub" placeholder="https://github.com/..." icon="fa-github" />
+            <Input name="website_url" label="Website" placeholder="https://..." icon="fa-globe" />
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-3 md:gap-4 pt-6 border-t border-gray-50">
+            <Button onClick={() => navigateTo('explore')} variant="secondary" className="w-full">Bekor qilish</Button>
+            <Button type="submit" className="w-full">Arizani Yuborish</Button>
+          </div>
+        </form>
+      </div>
+    );
+  };
+
+  const renderMyProjects = () => {
+    if (!currentUser) {
+      return <EmptyState icon="fa-lock" title="Kirish talab qilinadi" action={<Button onClick={() => openAuth('login')}>Kirish</Button>} />;
+    }
+
+    return (
+      <div className="space-y-8 md:space-y-12 animate-in fade-in">
+        <header className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">Loyihalarim</h1>
+            <Badge variant="active" size="md">{myStartups.length}</Badge>
+          </div>
+          <Button onClick={() => navigateTo('create')} icon="fa-plus" className="w-full md:w-auto h-12 md:h-10">Yangi Loyiha</Button>
+        </header>
+
+        {myStartups.length > 0 ? (
+          <div className="space-y-4">
+            {myStartups.map(s => (
+              <div key={s.id} className="bg-white border border-gray-100 rounded-xl p-5 md:p-6 flex flex-col md:flex-row items-center gap-5 md:gap-6 hover:shadow-md transition-all">
+                <img src={s.logo} className="w-16 h-16 rounded-lg object-cover border border-gray-100" alt="Logo" />
+                <div className="flex-grow min-w-0 text-center md:text-left">
+                  <div className="flex items-center justify-center md:justify-start gap-3 mb-1">
+                    <h3 className="text-base md:text-lg font-bold truncate">{s.nomi}</h3>
+                    <Badge variant={s.status === 'approved' ? 'success' : s.status === 'pending_admin' ? 'default' : 'danger'}>
+                      {s.status === 'pending_admin' ? 'Moderatsiyada' : s.status === 'approved' ? 'Faol' : 'Rad etilgan'}
+                    </Badge>
+                  </div>
+                  <div className="flex flex-wrap justify-center md:justify-start gap-3 md:gap-4 text-[10px] md:text-[11px] font-bold text-gray-400 uppercase tracking-widest">
+                    <span>{s.category}</span>
+                    <span><i className="fa-solid fa-users mr-1"></i> {s.a_zolar.length} builder</span>
+                    <span><i className="fa-solid fa-tasks mr-1"></i> {s.tasks?.length || 0} vazifa</span>
+                  </div>
+                </div>
+                <div className="flex gap-2 shrink-0 w-full md:w-auto">
+                  <Button variant="secondary" size="md" onClick={() => navigateTo('details', s.id)} className="flex-grow md:flex-none h-12 md:h-10">Boshqarish</Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyState 
+            icon="fa-rocket-launch" 
+            title="Hali loyihalar yo'q" 
+            subtitle="G'oyangiz bormi? Uni hozir platformada e'lon qiling." 
+            action={<Button onClick={() => navigateTo('create')}>Loyiha Yaratish</Button>}
+          />
+        )}
+      </div>
+    );
+  };
 
   const renderDetails = () => {
     if (!selectedStartup) return <EmptyState icon="fa-ban" title="Loyiha topilmadi" action={<Button onClick={() => navigateTo('explore')}>Ortga qaytish</Button>} />;
+
+    const isOwner = currentUser && selectedStartup.egasi_id === currentUser.id;
+    const isMember = currentUser && selectedStartup.a_zolar.some(m => m.user_id === currentUser.id);
 
     return (
       <div className="space-y-8 md:space-y-12 animate-in fade-in">
@@ -861,7 +991,7 @@ const App = () => {
             <div className="flex items-center gap-3 flex-wrap">
               <h1 className="text-3xl md:text-4xl font-extrabold tracking-tighter italic leading-none">{selectedStartup.nomi}</h1>
               <Badge variant="active" size="md">{selectedStartup.category}</Badge>
-              <Badge variant="success" size="md">{selectedStartup.status}</Badge>
+              <Badge variant={selectedStartup.status === 'approved' ? 'success' : 'default'} size="md">{selectedStartup.status === 'approved' ? 'Faol' : 'Moderatsiyada'}</Badge>
             </div>
             <p className="text-gray-500 text-[14px] md:text-[16px] max-w-2xl leading-relaxed italic">"{selectedStartup.tavsif}"</p>
             <div className="flex gap-4 flex-wrap">
@@ -870,8 +1000,9 @@ const App = () => {
             </div>
           </div>
           <div className="flex gap-2 md:gap-3 w-full md:w-auto shrink-0">
-            {selectedStartup.github_url && <Button variant="secondary" icon="fa-github" onClick={() => window.open(selectedStartup.github_url)} className="flex-1 md:flex-none" />}
-            <Button variant="ghost" icon="fa-share" className="flex-1 md:flex-none p-2" />
+            {selectedStartup.github_url && <Button variant="secondary" icon="fa-github" onClick={() => window.open(selectedStartup.github_url, '_blank')} className="flex-1 md:flex-none" />}
+            {selectedStartup.website_url && <Button variant="secondary" icon="fa-globe" onClick={() => window.open(selectedStartup.website_url, '_blank')} className="flex-1 md:flex-none" />}
+            <Button onClick={() => navigateTo('my-projects')} variant="ghost" icon="fa-arrow-left" className="flex-1 md:flex-none" />
           </div>
         </header>
 
@@ -896,20 +1027,27 @@ const App = () => {
                     <h4 className="text-[10px] md:text-[11px] font-extrabold uppercase tracking-widest text-gray-400 italic">
                       {status === 'todo' ? 'Kutilmoqda' : status === 'in-progress' ? 'Jarayonda' : 'Bajarildi'}
                     </h4>
-                    <Badge variant="default">{selectedStartup.tasks.filter(t => t.status === status).length}</Badge>
+                    <Badge variant="default">{selectedStartup.tasks?.filter(t => t.status === status).length || 0}</Badge>
                   </div>
                   <div className="space-y-3 min-h-[120px] md:min-h-[400px] p-4 bg-gray-50/30 rounded-2xl border border-gray-100">
-                    {selectedStartup.tasks.filter(t => t.status === status).map(t => (
+                    {selectedStartup.tasks?.filter(t => t.status === status).map(t => (
                       <div key={t.id} className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm group hover:border-black transition-all">
                         <div className="flex items-start justify-between mb-3">
-                          <h5 className="text-[14px] font-bold leading-tight">{t.title}</h5>
-                          <button onClick={() => {
-                            if (status === 'todo') handleMoveTask(selectedStartup.id, t.id, 'in-progress');
-                            else if (status === 'in-progress') handleMoveTask(selectedStartup.id, t.id, 'done');
-                            else handleMoveTask(selectedStartup.id, t.id, 'todo');
-                          }} className="text-gray-300 hover:text-black transition-colors p-2 shrink-0">
-                            <i className="fa-solid fa-arrow-right-long text-[10px]"></i>
-                          </button>
+                          <h5 className="text-[14px] font-bold leading-tight flex-grow">{t.title}</h5>
+                          <div className="flex gap-1 shrink-0">
+                            <button onClick={() => {
+                              if (status === 'todo') handleMoveTask(selectedStartup.id, t.id, 'in-progress');
+                              else if (status === 'in-progress') handleMoveTask(selectedStartup.id, t.id, 'done');
+                              else handleMoveTask(selectedStartup.id, t.id, 'todo');
+                            }} className="text-gray-300 hover:text-black transition-colors p-2 shrink-0" title="Keyingi bosqichga o'tkazish">
+                              <i className="fa-solid fa-arrow-right-long text-[10px]"></i>
+                            </button>
+                            {isOwner && (
+                              <button onClick={() => handleDeleteTask(selectedStartup.id, t.id)} className="text-gray-300 hover:text-rose-600 transition-colors p-2 shrink-0" title="O'chirish">
+                                <i className="fa-solid fa-trash text-[10px]"></i>
+                              </button>
+                            )}
+                          </div>
                         </div>
                         <p className="text-[12px] text-gray-500 mb-4 line-clamp-2">{t.description}</p>
                         <div className="flex items-center justify-between">
@@ -921,7 +1059,7 @@ const App = () => {
                         </div>
                       </div>
                     ))}
-                    {status === 'todo' && (
+                    {status === 'todo' && (isOwner || isMember) && (
                       <button onClick={() => handleAddTask(selectedStartup.id)} className="w-full py-8 border-2 border-dashed border-gray-200 rounded-xl flex flex-col items-center justify-center text-gray-300 hover:text-black hover:border-black transition-all group">
                         <i className="fa-solid fa-plus text-sm mb-1"></i>
                         <span className="text-[10px] font-bold uppercase tracking-widest">Yangi vazifa</span>
@@ -945,29 +1083,13 @@ const App = () => {
                     <Badge variant="active" size="sm" className="mt-1 truncate max-w-full">{m.role}</Badge>
                     <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-2">{new Date(m.joined_at).toLocaleDateString()}</p>
                   </div>
-                  {currentUser?.id === selectedStartup.egasi_id && m.user_id !== currentUser.id && (
-                    <button className="absolute top-4 right-4 text-gray-200 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all p-2">
-                      <i className="fa-solid fa-user-minus text-sm"></i>
-                    </button>
-                  )}
                 </div>
               ))}
-              <div className="border-2 border-dashed border-gray-100 rounded-xl p-6 flex flex-col items-center justify-center opacity-40 hover:opacity-100 cursor-pointer transition-all">
-                <i className="fa-solid fa-user-plus text-lg md:text-xl mb-2"></i>
-                <p className="text-[10px] md:text-[11px] font-bold uppercase tracking-widest">Hamkor qidirish</p>
-              </div>
             </div>
           )}
 
-          {activeDetailTab === 'sozlamalar' && (
+          {activeDetailTab === 'sozlamalar' && isOwner && (
             <div className="max-w-xl mx-auto md:mx-0 space-y-10 md:space-y-12">
-              <section className="space-y-6">
-                <h3 className="text-[11px] md:text-[12px] font-bold uppercase tracking-widest text-black/30 border-b border-gray-100 pb-2">Asosiy ma'lumotlar</h3>
-                <Input label="Startup Nomi" defaultValue={selectedStartup.nomi} icon="fa-rocket" />
-                <TextArea label="Tavsif" defaultValue={selectedStartup.tavsif} />
-                <Button className="w-full md:w-auto h-12 md:h-10">O'zgarishlarni saqlash</Button>
-              </section>
-
               <section className="space-y-6 pt-10 md:pt-12 border-t border-gray-100">
                 <h3 className="text-[11px] md:text-[12px] font-bold uppercase tracking-widest text-rose-500/50 border-b border-rose-100 pb-2">Xavfli hudud</h3>
                 <div className="p-5 md:p-6 bg-rose-50 border border-rose-100 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-6">
@@ -975,7 +1097,7 @@ const App = () => {
                     <p className="text-[14px] font-bold text-rose-900 mb-1">Loyihani o'chirish</p>
                     <p className="text-[12px] text-rose-600/80">Loyiha o'chirilgach, uni qayta tiklab bo'lmaydi.</p>
                   </div>
-                  <Button variant="danger" className="shrink-0 w-full sm:w-auto h-12 md:h-10">O'chirish</Button>
+                  <Button onClick={() => handleDeleteStartup(selectedStartup.id)} variant="danger" className="shrink-0 w-full sm:w-auto h-12 md:h-10">O'chirish</Button>
                 </div>
               </section>
             </div>
@@ -985,38 +1107,215 @@ const App = () => {
     );
   };
 
-  const renderProfile = () => (
-    <div className="max-w-[800px] mx-auto space-y-10 md:space-y-12 animate-in fade-in">
-      {currentUser ? (
-        <>
-          <div className="bg-white border border-gray-100 rounded-2xl p-6 md:p-10 relative overflow-hidden shadow-sm group">
-            <div className="absolute top-0 left-0 w-full h-24 md:h-24 bg-gray-50 border-b border-gray-100"></div>
-            <div className="relative z-10 flex flex-col items-center text-center">
-              <div className="relative group/avatar mb-4 md:mb-6">
-                <img src={currentUser.avatar} className="w-24 h-24 md:w-32 md:h-32 rounded-full border-4 border-white shadow-xl grayscale hover:grayscale-0 transition-all object-cover" alt="Profile" />
-                <button onClick={() => { setEditedUser(currentUser); setIsEditProfileModalOpen(true); }} className="absolute inset-0 bg-black/40 rounded-full flex items-center justify-center text-white opacity-0 group-hover/avatar:opacity-100 transition-all"><i className="fa-solid fa-camera"></i></button>
-              </div>
-              <h2 className="text-2xl md:text-3xl font-extrabold tracking-tight italic mb-2 px-2">{currentUser.name}</h2>
-              <div className="flex gap-2 mb-4 justify-center flex-wrap px-4">
-                <Badge variant="active" className="truncate max-w-[200px]">{currentUser.email}</Badge>
-                {currentUser.phone !== '000' && <Badge>{currentUser.phone}</Badge>}
-              </div>
-              <p className="text-[13px] md:text-[14px] text-gray-500 max-w-md italic mb-6 md:mb-8 px-6">
-                {currentUser.bio || "O'zingiz haqingizda bir necha so'z yozing."}
-              </p>
-              <div className="flex gap-3 md:gap-4 flex-wrap justify-center w-full max-w-[400px]">
-                <Button onClick={() => { setEditedUser(currentUser); setIsEditProfileModalOpen(true); }} variant="secondary" size="md" className="flex-1 h-12 md:h-10">Tahrirlash</Button>
-                {currentUser.portfolio_url && <Button variant="ghost" icon="fa-link" onClick={() => window.open(currentUser.portfolio_url)} className="flex-1 h-12 md:h-10 border border-gray-100" />}
-              </div>
+  const renderProfile = () => {
+    if (!currentUser) {
+      return <EmptyState icon="fa-lock" title="Kirish talab qilinadi" action={<Button onClick={() => openAuth('login')}>Kirish</Button>} />;
+    }
+
+    return (
+      <div className="max-w-[800px] mx-auto space-y-10 md:space-y-12 animate-in fade-in">
+        <div className="bg-white border border-gray-100 rounded-2xl p-6 md:p-10 relative overflow-hidden shadow-sm group">
+          <div className="absolute top-0 left-0 w-full h-24 md:h-24 bg-gray-50 border-b border-gray-100"></div>
+          <div className="relative z-10 flex flex-col items-center text-center">
+            <div className="relative group/avatar mb-4 md:mb-6">
+              <img src={currentUser.avatar} className="w-24 h-24 md:w-32 md:h-32 rounded-full border-4 border-white shadow-xl grayscale hover:grayscale-0 transition-all object-cover" alt="Profile" />
+              <button onClick={() => { setEditedUser(currentUser); setIsEditProfileModalOpen(true); }} className="absolute inset-0 bg-black/40 rounded-full flex items-center justify-center text-white opacity-0 group-hover/avatar:opacity-100 transition-all"><i className="fa-solid fa-camera"></i></button>
+            </div>
+            <h2 className="text-2xl md:text-3xl font-extrabold tracking-tight italic mb-2 px-2">{currentUser.name}</h2>
+            <div className="flex gap-2 mb-4 justify-center flex-wrap px-4">
+              <Badge variant="active" className="truncate max-w-[200px]">{currentUser.email}</Badge>
+              {currentUser.phone && currentUser.phone !== '000' && <Badge>{currentUser.phone}</Badge>}
+            </div>
+            <p className="text-[13px] md:text-[14px] text-gray-500 max-w-md italic mb-6 md:mb-8 px-6">
+              {currentUser.bio || "O'zingiz haqingizda bir necha so'z yozing."}
+            </p>
+            <div className="flex gap-3 md:gap-4 flex-wrap justify-center w-full max-w-[400px]">
+              <Button onClick={() => { setEditedUser(currentUser); setIsEditProfileModalOpen(true); }} variant="secondary" size="md" className="flex-1 h-12 md:h-10">Tahrirlash</Button>
+              {currentUser.portfolio_url && <Button variant="ghost" icon="fa-link" onClick={() => window.open(currentUser.portfolio_url, '_blank')} className="flex-1 h-12 md:h-10 border border-gray-100" />}
             </div>
           </div>
+        </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-6">
+          {[
+            { val: myStartups.length, label: 'Loyihalar' },
+            { val: incomingRequests.length, label: 'So\'rovlar' },
+            { val: userNotifications.length, label: 'Notiflar' },
+            { val: myStartups.reduce((acc, s) => acc + (s.tasks?.length || 0), 0), label: 'Vazifalar' }
+          ].map((s, i) => (
+            <div key={i} className="bg-white border border-gray-100 rounded-xl p-4 md:p-6 text-center shadow-sm hover:border-black transition-all">
+              <p className="text-xl md:text-3xl font-extrabold italic mb-1">{s.val}</p>
+              <p className="text-[9px] md:text-[10px] font-bold text-gray-400 uppercase tracking-widest">{s.label}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="space-y-4 md:space-y-6 px-2">
+          <h3 className="text-[11px] md:text-[12px] font-bold uppercase tracking-widest text-black/30 border-b border-gray-100 pb-2">Ko'nikmalar</h3>
+          <div className="flex flex-wrap gap-2">
+            {currentUser.skills && currentUser.skills.length > 0 ? currentUser.skills.map((s, i) => <Badge key={i} variant="default" size="md" className="!text-[11px] md:!text-[12px]"># {s}</Badge>) : (
+              <p className="text-[12px] md:text-[13px] text-gray-400 italic">Hali ko'nikmalar kiritilmagan.</p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderAdmin = () => {
+    if (!currentUser || currentUser.role !== 'admin') {
+      return <EmptyState icon="fa-lock" title="Ruxsat yo'q" action={<Button onClick={() => navigateTo('explore')}>Ortga</Button>} />;
+    }
+
+    const stats = adminStats || {
+      users: allUsers.length,
+      startups: startups.length,
+      pending_startups: startups.filter(s => s.status === 'pending_admin').length,
+      join_requests: joinRequests.length,
+      notifications: notifications.length
+    };
+
+    const adminTabs = [
+      { key: 'moderation', label: 'Moderatsiya' },
+      { key: 'users', label: 'Foydalanuvchilar' },
+      { key: 'startups', label: 'Startuplar' },
+      { key: 'categories', label: 'Kategoriya' },
+      { key: 'stats', label: 'Statistika' },
+      { key: 'audit', label: 'Audit' }
+    ];
+
+    return (
+      <div className="space-y-8 md:space-y-12 animate-in fade-in">
+        <header className="flex flex-col gap-4">
+          <div className="flex items-center gap-4">
+            <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">Admin Panel</h1>
+            <Badge variant="danger" size="md">{stats.pending_startups}</Badge>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {adminTabs.map(t => (
+              <button
+                key={t.key}
+                onClick={() => setAdminTab(t.key)}
+                className={`h-9 px-4 rounded-full text-[12px] font-semibold border transition-all ${adminTab === t.key ? 'bg-black border-black text-white' : 'bg-white border-gray-200 text-gray-600 hover:border-black'}`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </header>
+
+        {adminTab === 'moderation' && (
+          <div className="space-y-4">
+            {startups.filter(s => s.status === 'pending_admin').map(s => (
+              <div key={s.id} className="bg-white border border-gray-200 rounded-2xl p-6 md:p-8 flex flex-col xl:flex-row items-start gap-6 md:gap-8 hover:shadow-lg transition-all">
+                <img src={s.logo} className="w-16 h-16 md:w-20 md:h-20 rounded-xl grayscale shadow-sm border border-gray-100 object-cover shrink-0" alt="Logo" />
+                <div className="flex-grow space-y-3 md:space-y-4 min-w-0">
+                  <div>
+                    <h3 className="text-xl md:text-2xl font-extrabold tracking-tight italic truncate">{s.nomi}</h3>
+                    <Badge variant="active" className="mt-2">{s.category}</Badge>
+                  </div>
+                  <p className="text-gray-500 text-[13px] md:text-[14px] italic leading-relaxed">"{s.tavsif}"</p>
+                  <div className="flex flex-wrap gap-4 text-[10px] md:text-[11px] font-bold text-gray-400 uppercase tracking-widest">
+                    <span>Egasi: <span className="text-black">{s.egasi_name}</span></span>
+                    <span>Sana: <span className="text-black">{new Date(s.yaratilgan_vaqt).toLocaleDateString()}</span></span>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3 shrink-0 w-full xl:w-auto">
+                  <Button onClick={() => handleAdminStartupStatus(s.id, 'approved')} className="flex-1 xl:flex-none h-12 px-10">Tasdiqlash</Button>
+                  <Button onClick={() => handleAdminStartupStatus(s.id, 'rejected')} variant="danger" className="flex-1 xl:flex-none h-12 px-10">Rad etish</Button>
+                </div>
+              </div>
+            ))}
+            {startups.filter(s => s.status === 'pending_admin').length === 0 && (
+              <EmptyState icon="fa-check-circle" title="Moderatsiya kutayotgan arizalar yo'q" />
+            )}
+          </div>
+        )}
+
+        {adminTab === 'users' && (
+          <div className="space-y-3">
+            {allUsers.map(u => (
+              <div key={u.id} className="bg-white border border-gray-200 rounded-xl p-4 md:p-5 flex flex-col md:flex-row items-start md:items-center gap-4">
+                <img src={u.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(u.name)}`} className="w-12 h-12 rounded-full border border-gray-100 object-cover" alt="Avatar" />
+                <div className="flex-grow min-w-0">
+                  <p className="text-[14px] font-bold truncate">{u.name}</p>
+                  <p className="text-[12px] text-gray-500 truncate">{u.email}</p>
+                  <div className="flex gap-2 mt-2">
+                    <Badge variant={u.role === 'admin' ? 'active' : 'default'}>{u.role}</Badge>
+                    {u.banned && <Badge variant="danger">Banned</Badge>}
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
+                  <select
+                    value={u.role}
+                    onChange={(e) => handleAdminUserRole(u.id, e.target.value)}
+                    className="h-10 px-3 text-[12px] border border-gray-200 rounded-lg bg-white"
+                  >
+                    <option value="user">user</option>
+                    <option value="admin">admin</option>
+                  </select>
+                  <Button
+                    variant={u.banned ? 'secondary' : 'danger'}
+                    className="h-10 px-5"
+                    onClick={() => handleAdminUserBan(u.id, !u.banned)}
+                  >
+                    {u.banned ? 'Unban' : 'Ban'}
+                  </Button>
+                  <Button variant="ghost" className="h-10 px-5 border border-gray-100" onClick={() => handleAdminUserDelete(u.id)}>Delete</Button>
+                </div>
+              </div>
+            ))}
+            {allUsers.length === 0 && <EmptyState icon="fa-user-slash" title="Foydalanuvchilar yo'q" />}
+          </div>
+        )}
+
+        {adminTab === 'startups' && (
+          <div className="space-y-3">
+            {startups.map(s => (
+              <div key={s.id} className="bg-white border border-gray-200 rounded-xl p-4 md:p-5 flex flex-col md:flex-row items-start md:items-center gap-4">
+                <img src={s.logo} className="w-12 h-12 rounded-lg border border-gray-100 object-cover" alt="Logo" />
+                <div className="flex-grow min-w-0">
+                  <p className="text-[14px] font-bold truncate">{s.nomi}</p>
+                  <p className="text-[12px] text-gray-500 truncate">{s.egasi_name}</p>
+                  <div className="flex gap-2 mt-2">
+                    <Badge variant={s.status === 'approved' ? 'success' : s.status === 'rejected' ? 'danger' : 'default'}>{s.status}</Badge>
+                    <Badge>{s.category}</Badge>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
+                  <Button className="h-10 px-5" onClick={() => handleAdminStartupStatus(s.id, 'approved')}>Approve</Button>
+                  <Button variant="danger" className="h-10 px-5" onClick={() => handleAdminStartupStatus(s.id, 'rejected')}>Reject</Button>
+                  <Button variant="ghost" className="h-10 px-5 border border-gray-100" onClick={() => handleAdminStartupDelete(s.id)}>Delete</Button>
+                </div>
+              </div>
+            ))}
+            {startups.length === 0 && <EmptyState icon="fa-rocket" title="Loyihalar yo'q" />}
+          </div>
+        )}
+
+        {adminTab === 'categories' && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              {categories.map((c, i) => (
+                <div key={`${c}-${i}`} className="flex items-center gap-2 bg-white border border-gray-200 rounded-full px-4 py-2 text-[12px]">
+                  <span className="font-semibold">{c}</span>
+                  <button onClick={() => handleDeleteCategory(c)} className="text-gray-400 hover:text-rose-600"><i className="fa-solid fa-xmark"></i></button>
+                </div>
+              ))}
+              {categories.length === 0 && <p className="text-[12px] text-gray-400 italic">Kategoriya yo'q</p>}
+            </div>
+            <Button onClick={handleAddCategory} className="h-10 px-6">Kategoriya qo'shish</Button>
+          </div>
+        )}
+
+        {adminTab === 'stats' && (
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 md:gap-6">
             {[
-              { val: myStartups.length, label: 'Loyihalar' },
-              { val: incomingRequests.length, label: 'So\'rovlar' },
-              { val: userNotifications.length, label: 'Notiflar' },
-              { val: '24', label: 'Score' }
+              { val: stats.users, label: 'Users' },
+              { val: stats.startups, label: 'Startups' },
+              { val: stats.pending_startups, label: 'Pending' },
+              { val: stats.join_requests, label: 'Requests' },
+              { val: stats.notifications, label: 'Notifications' }
             ].map((s, i) => (
               <div key={i} className="bg-white border border-gray-100 rounded-xl p-4 md:p-6 text-center shadow-sm hover:border-black transition-all">
                 <p className="text-xl md:text-3xl font-extrabold italic mb-1">{s.val}</p>
@@ -1024,118 +1323,109 @@ const App = () => {
               </div>
             ))}
           </div>
+        )}
 
-          <div className="space-y-4 md:space-y-6 px-2">
-            <h3 className="text-[11px] md:text-[12px] font-bold uppercase tracking-widest text-black/30 border-b border-gray-100 pb-2">Ko'nikmalar</h3>
-            <div className="flex flex-wrap gap-2">
-              {currentUser.skills.length > 0 ? currentUser.skills.map((s, i) => <Badge key={i} variant="default" size="md" className="!text-[11px] md:!text-[12px]"># {s}</Badge>) : (
-                <p className="text-[12px] md:text-[13px] text-gray-400 italic">Hali ko'nikmalar kiritilmagan.</p>
-              )}
-            </div>
-          </div>
-        </>
-      ) : (
-        <EmptyState icon="fa-lock" title="Profil yopiq" action={<Button onClick={() => setShowAuthModal(true)}>Kirish</Button>} />
-      )}
-    </div>
-  );
-
-  const renderAdmin = () => (
-    <div className="space-y-8 md:space-y-12 animate-in fade-in">
-      <header className="flex items-center gap-4">
-        <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">Moderatsiya</h1>
-        <Badge variant="danger" size="md">{startups.filter(s => s.status === 'pending_admin').length}</Badge>
-      </header>
-
-      <div className="space-y-4">
-        {startups.filter(s => s.status === 'pending_admin').map(s => (
-          <div key={s.id} className="bg-white border border-gray-200 rounded-2xl p-6 md:p-8 flex flex-col xl:flex-row items-start gap-6 md:gap-8 hover:shadow-lg transition-all">
-            <img src={s.logo} className="w-16 h-16 md:w-20 md:h-20 rounded-xl grayscale shadow-sm border border-gray-100 object-cover shrink-0" alt="Logo" />
-            <div className="flex-grow space-y-3 md:space-y-4 min-w-0">
-              <div>
-                <h3 className="text-xl md:text-2xl font-extrabold tracking-tight italic truncate">{s.nomi}</h3>
-                <Badge variant="active" className="mt-2">{s.category}</Badge>
+        {adminTab === 'audit' && (
+          <div className="space-y-3">
+            {auditLogs.map(log => (
+              <div key={log.id} className="bg-white border border-gray-200 rounded-xl p-4 md:p-5">
+                <div className="flex items-center justify-between">
+                  <p className="text-[12px] font-bold uppercase tracking-widest text-gray-400">{log.action}</p>
+                  <p className="text-[10px] text-gray-400">{new Date(log.created_at).toLocaleString()}</p>
+                </div>
+                <p className="text-[12px] text-gray-600 mt-2">
+                  Entity: <span className="font-semibold">{log.entity_type}</span> / {log.entity_id}
+                </p>
+                <p className="text-[12px] text-gray-600">Actor: {log.actor_id}</p>
               </div>
-              <p className="text-gray-500 text-[13px] md:text-[14px] italic leading-relaxed">"{s.tavsif}"</p>
-              <div className="flex flex-wrap gap-4 text-[10px] md:text-[11px] font-bold text-gray-400 uppercase tracking-widest">
-                <span>Egasi: <span className="text-black">{s.egasi_name}</span></span>
-              </div>
-            </div>
-            <div className="flex flex-col sm:flex-row gap-3 shrink-0 w-full xl:w-auto">
-              <Button onClick={() => handleAdminModeration(s.id, 'approved')} className="flex-1 xl:flex-none h-12 px-10">Tasdiqlash</Button>
-              <Button onClick={() => handleAdminModeration(s.id, 'rejected')} variant="danger" className="flex-1 xl:flex-none h-12 px-10">Rad etish</Button>
-            </div>
+            ))}
+            {auditLogs.length === 0 && <EmptyState icon="fa-list" title="Audit log bo'sh" />}
           </div>
-        ))}
-        {startups.filter(s => s.status === 'pending_admin').length === 0 && (
-          <EmptyState icon="fa-check-circle" title="Moderatsiya kutayotgan arizalar yo'q" />
         )}
       </div>
-    </div>
-  );
+    );
+  };
 
-  const renderRequests = () => (
-    <div className="max-w-[800px] mx-auto space-y-8 md:space-y-12 animate-in fade-in">
-      <header className="flex items-center gap-4">
-        <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">So'rovlar</h1>
-        <Badge variant="active" size="md">{incomingRequests.length}</Badge>
-      </header>
+  const renderRequests = () => {
+    if (!currentUser) {
+      return <EmptyState icon="fa-lock" title="Kirish talab qilinadi" action={<Button onClick={() => openAuth('login')}>Kirish</Button>} />;
+    }
 
-      <div className="space-y-4">
-        {incomingRequests.map(r => (
-          <div key={r.id} className="bg-white border border-gray-200 rounded-xl p-6 md:p-8 flex flex-col md:flex-row items-center gap-6 md:gap-8 hover:shadow-md transition-all">
-            <div className="w-12 h-12 md:w-14 md:h-14 bg-gray-50 rounded-full flex items-center justify-center font-black text-lg md:text-xl italic border border-gray-100 shadow-inner shrink-0">{r.user_name[0]}</div>
-            <div className="flex-grow text-center md:text-left space-y-2 min-w-0">
-              <h3 className="text-lg md:text-xl font-bold tracking-tight truncate">{r.user_name}</h3>
-              <div className="flex gap-2 justify-center md:justify-start flex-wrap">
-                <Badge variant="active">{r.specialty}</Badge>
-                <Badge className="truncate max-w-[150px]">Loyiha: {r.startup_name}</Badge>
+    return (
+      <div className="max-w-[800px] mx-auto space-y-8 md:space-y-12 animate-in fade-in">
+        <header className="flex items-center gap-4">
+          <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight italic">So'rovlar</h1>
+          <Badge variant="active" size="md">{incomingRequests.length}</Badge>
+        </header>
+
+        <div className="space-y-4">
+          {incomingRequests.map(r => (
+            <div key={r.id} className="bg-white border border-gray-200 rounded-xl p-6 md:p-8 flex flex-col md:flex-row items-center gap-6 md:gap-8 hover:shadow-md transition-all">
+              <div className="w-12 h-12 md:w-14 md:h-14 bg-gray-50 rounded-full flex items-center justify-center font-black text-lg md:text-xl italic border border-gray-100 shadow-inner shrink-0">{r.user_name[0]}</div>
+              <div className="flex-grow text-center md:text-left space-y-2 min-w-0">
+                <h3 className="text-lg md:text-xl font-bold tracking-tight truncate">{r.user_name}</h3>
+                <div className="flex gap-2 justify-center md:justify-start flex-wrap">
+                  <Badge variant="active">{r.specialty}</Badge>
+                  <Badge className="truncate max-w-[150px]">Loyiha: {r.startup_name}</Badge>
+                </div>
+                <p className="text-gray-500 text-[12px] md:text-[13px] italic">"{r.comment}"</p>
+                <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">{new Date(r.created_at).toLocaleDateString()}</p>
               </div>
-              <p className="text-gray-500 text-[12px] md:text-[13px] italic">"{r.comment}"</p>
+              <div className="flex gap-3 w-full md:w-auto shrink-0">
+                <Button onClick={() => handleRequestAction(r.id, 'accept')} className="flex-1 md:flex-none px-6 md:px-8 h-12">Qabul</Button>
+                <Button onClick={() => handleRequestAction(r.id, 'decline')} variant="danger" className="flex-1 md:flex-none px-6 md:px-8 h-12">Rad</Button>
+              </div>
             </div>
-            <div className="flex gap-3 w-full md:w-auto shrink-0">
-              <Button onClick={() => handleRequestAction(r.id, 'accept')} className="flex-1 md:flex-none px-6 md:px-8 h-12">Qabul</Button>
-              <Button onClick={() => handleRequestAction(r.id, 'decline')} variant="danger" className="flex-1 md:flex-none px-6 md:px-8 h-12">Rad</Button>
-            </div>
-          </div>
-        ))}
-        {incomingRequests.length === 0 && (
-          <EmptyState icon="fa-user-clock" title="Yangi so'rovlar yo'q" />
-        )}
+          ))}
+          {incomingRequests.length === 0 && (
+            <EmptyState icon="fa-user-clock" title="Yangi so'rovlar yo'q" />
+          )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
-  const renderInbox = () => (
-    <div className="max-w-[600px] mx-auto space-y-6 md:space-y-8 animate-in fade-in">
-      <header className="flex items-center justify-between border-b border-gray-100 pb-4 md:pb-6 px-2">
-        <h1 className="text-xl md:text-2xl font-extrabold italic tracking-tight">Bildirishnomalar</h1>
-        <Button variant="ghost" size="sm" onClick={() => setNotifications(prev => prev.map(n => ({ ...n, is_read: true })))} className="text-[10px] md:text-[12px]">Barchasi o'qildi</Button>
-      </header>
+  const renderInbox = () => {
+    if (!currentUser) {
+      return <EmptyState icon="fa-lock" title="Kirish talab qilinadi" action={<Button onClick={() => openAuth('login')}>Kirish</Button>} />;
+    }
 
-      <div className="space-y-3 px-2">
-        {userNotifications.map(n => (
-          <div 
-            key={n.id} 
-            onClick={() => setNotifications(prev => prev.map(item => item.id === n.id ? { ...item, is_read: true } : item))}
-            className={`p-4 md:p-5 rounded-xl border flex items-start gap-3 md:gap-4 transition-all cursor-pointer ${n.is_read ? 'bg-white border-gray-100 opacity-60' : 'bg-gray-50 border-black shadow-sm'}`}
-          >
-            <div className={`w-8 h-8 md:w-10 md:h-10 rounded-lg flex items-center justify-center shrink-0 ${n.type === 'success' ? 'bg-emerald-100 text-emerald-700' : n.type === 'error' ? 'bg-rose-100 text-rose-700' : 'bg-black text-white'}`}>
-              <i className={`fa-solid ${n.type === 'success' ? 'fa-check' : n.type === 'error' ? 'fa-triangle-exclamation' : 'fa-info'} text-[12px] md:text-sm`}></i>
-            </div>
-            <div className="flex-grow min-w-0">
-              <h5 className="text-[13px] md:text-[14px] font-bold italic mb-1 truncate">{n.title}</h5>
-              <p className="text-[12px] md:text-[13px] text-gray-500 leading-relaxed mb-2 line-clamp-3">{n.text}</p>
-              <p className="text-[9px] md:text-[10px] font-bold text-gray-400 uppercase tracking-widest">{new Date(n.created_at).toLocaleString()}</p>
-            </div>
+    return (
+      <div className="max-w-[600px] mx-auto space-y-6 md:space-y-8 animate-in fade-in">
+        <header className="flex items-center justify-between border-b border-gray-100 pb-4 md:pb-6 px-2">
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl md:text-2xl font-extrabold italic tracking-tight">Bildirishnomalar</h1>
+            {unreadNotifCount > 0 && <Badge variant="danger" size="md">{unreadNotifCount}</Badge>}
           </div>
-        ))}
-        {userNotifications.length === 0 && (
-          <EmptyState icon="fa-bell-slash" title="Bildirishnomalar yo'q" />
-        )}
+          {unreadNotifCount > 0 && (
+            <Button variant="ghost" size="sm" onClick={handleMarkAllAsRead} className="text-[10px] md:text-[12px]">Barchasi o'qildi</Button>
+          )}
+        </header>
+
+        <div className="space-y-3 px-2">
+          {userNotifications.map(n => (
+            <div 
+              key={n.id} 
+              onClick={() => handleMarkAsRead(n.id)}
+              className={`p-4 md:p-5 rounded-xl border flex items-start gap-3 md:gap-4 transition-all cursor-pointer ${n.is_read ? 'bg-white border-gray-100 opacity-60' : 'bg-gray-50 border-black shadow-sm'}`}
+            >
+              <div className={`w-8 h-8 md:w-10 md:h-10 rounded-lg flex items-center justify-center shrink-0 ${n.type === 'success' ? 'bg-emerald-100 text-emerald-700' : n.type === 'danger' ? 'bg-rose-100 text-rose-700' : 'bg-black text-white'}`}>
+                <i className={`fa-solid ${n.type === 'success' ? 'fa-check' : n.type === 'danger' ? 'fa-triangle-exclamation' : 'fa-info'} text-[12px] md:text-sm`}></i>
+              </div>
+              <div className="flex-grow min-w-0">
+                <h5 className="text-[13px] md:text-[14px] font-bold italic mb-1 truncate">{n.title}</h5>
+                <p className="text-[12px] md:text-[13px] text-gray-500 leading-relaxed mb-2 line-clamp-3">{n.text}</p>
+                <p className="text-[9px] md:text-[10px] font-bold text-gray-400 uppercase tracking-widest">{new Date(n.created_at).toLocaleString()}</p>
+              </div>
+            </div>
+          ))}
+          {userNotifications.length === 0 && (
+            <EmptyState icon="fa-bell-slash" title="Bildirishnomalar yo'q" />
+          )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   if (loading) {
     return (
@@ -1162,7 +1452,13 @@ const App = () => {
           <div className="hidden lg:flex flex-grow max-w-lg mx-8">
             <div className="relative w-full group">
               <i className="fa-solid fa-search absolute left-4 top-1/2 -translate-y-1/2 text-gray-300 group-focus-within:text-black transition-colors"></i>
-              <input type="text" placeholder="Global qidiruv..." className="w-full h-10 bg-gray-50/50 border border-gray-100 rounded-lg pl-11 pr-4 text-[13px] focus:bg-white focus:border-black transition-all outline-none shadow-inner" />
+              <input 
+                type="text" 
+                placeholder="Global qidiruv..." 
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full h-10 bg-gray-50/50 border border-gray-100 rounded-lg pl-11 pr-4 text-[13px] focus:bg-white focus:border-black transition-all outline-none shadow-inner" 
+              />
             </div>
           </div>
 
@@ -1171,7 +1467,7 @@ const App = () => {
               <i className="fa-solid fa-bell text-[18px]"></i>
               {unreadNotifCount > 0 && <span className="absolute top-1 right-1 h-4 w-4 bg-black text-white text-[9px] font-black flex items-center justify-center rounded-full ring-2 ring-white">{unreadNotifCount}</span>}
             </button>
-            <button onClick={() => navigateTo('create')} className="w-9 h-9 md:w-10 md:h-10 bg-black text-white flex items-center justify-center rounded-lg shadow-lg hover:scale-105 active:scale-95 transition-all"><i className="fa-solid fa-plus text-sm"></i></button>
+            {currentUser && <button onClick={() => navigateTo('create')} className="w-9 h-9 md:w-10 md:h-10 bg-black text-white flex items-center justify-center rounded-lg shadow-lg hover:scale-105 active:scale-95 transition-all"><i className="fa-solid fa-plus text-sm"></i></button>}
           </div>
         </header>
 
@@ -1207,7 +1503,7 @@ const App = () => {
              </div>
              <div className="flex-grow p-4 md:p-6 space-y-4 overflow-y-auto custom-scrollbar bg-white">
                 <div className="p-4 bg-gray-50 border border-gray-100 rounded-xl text-[12px] md:text-[13px] text-gray-600 italic leading-relaxed">
-                  Assalomu alaykum! Startup savollaringizni bering.
+                  Assalomu alaykum! Men sizning startup bo'yicha maslahatchi AI mentorigizman. Savollaringizni bering!
                 </div>
                 {aiChat.map(m => (
                    <div key={m.id} className={`flex ${m.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -1226,7 +1522,7 @@ const App = () => {
                   placeholder="Savolingizni yozing..."
                   className="flex-grow bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-[14px] md:text-[13px] outline-none focus:border-black transition-all"
                 />
-                <button onClick={handleSendAIMessage} className="w-10 h-10 md:w-12 md:h-12 bg-black text-white flex items-center justify-center rounded-xl hover:scale-105 active:scale-95 transition-all shrink-0"><i className="fa-solid fa-paper-plane text-xs"></i></button>
+                <button onClick={handleSendAIMessage} disabled={aiLoading} className="w-10 h-10 md:w-12 md:h-12 bg-black text-white flex items-center justify-center rounded-xl hover:scale-105 active:scale-95 transition-all shrink-0 disabled:opacity-50"><i className="fa-solid fa-paper-plane text-xs"></i></button>
              </div>
           </div>
         )}
@@ -1249,7 +1545,7 @@ const App = () => {
               {authMode === 'register' && (
                 <div className="space-y-4 animate-in fade-in duration-300">
                   <Input required name="name" label="To'liq ism" icon="fa-signature" placeholder="Ism Sharif" />
-                  <Input required name="phone" label="Telefon" icon="fa-phone" placeholder="+998" />
+                  <Input name="phone" label="Telefon" icon="fa-phone" placeholder="+998" />
                   <FileUpload label="Profil rasmi" onChange={handleFileChange} preview={tempFileBase64 || undefined} />
                 </div>
               )}
@@ -1281,19 +1577,19 @@ const App = () => {
       )}
 
       {/* EDIT PROFILE MODAL */}
-      <Modal isOpen={isEditProfileModalOpen} onClose={() => { setIsEditProfileModalOpen(false); setEditedUser({}); }} title="Profilni tahrirlash">
+      <Modal isOpen={isEditProfileModalOpen} onClose={() => { setIsEditProfileModalOpen(false); setEditedUser({}); setTempFileBase64(null); }} title="Profilni tahrirlash">
         <div className="space-y-6 md:space-y-8">
           <FileUpload label="Profil rasmi" onChange={handleFileChange} preview={editedUser.avatar || currentUser?.avatar} />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
-            <Input label="Ism" value={editedUser.name || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, name: e.target.value }))} icon="fa-signature" />
-            <Input label="Telefon" value={editedUser.phone || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, phone: e.target.value }))} icon="fa-phone" />
+            <Input label="Ism" value={editedUser.name || currentUser?.name || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, name: e.target.value }))} icon="fa-signature" />
+            <Input label="Telefon" value={editedUser.phone || currentUser?.phone || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, phone: e.target.value }))} icon="fa-phone" />
           </div>
-          <TextArea label="Qisqacha bio" value={editedUser.bio || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, bio: e.target.value }))} placeholder="Sizning startup tajribangiz..." />
-          <Input label="Ko'nikmalar" value={editedUser.skills?.join(', ') || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, skills: e.target.value.split(',').map((s) => s.trim()) }))} helper="Vergul bilan ajrating" icon="fa-bolt" />
-          <Input label="Portfolio" value={editedUser.portfolio_url || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, portfolio_url: e.target.value }))} placeholder="https://..." icon="fa-link" />
+          <TextArea label="Qisqacha bio" value={editedUser.bio || currentUser?.bio || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, bio: e.target.value }))} placeholder="Sizning startup tajribangiz..." />
+          <Input label="Ko'nikmalar" value={editedUser.skills?.join(', ') || currentUser?.skills?.join(', ') || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, skills: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) }))} helper="Vergul bilan ajrating" icon="fa-bolt" placeholder="React, Node.js, UI/UX" />
+          <Input label="Portfolio" value={editedUser.portfolio_url || currentUser?.portfolio_url || ''} onChange={(e) => setEditedUser(prev => ({ ...prev, portfolio_url: e.target.value }))} placeholder="https://..." icon="fa-link" />
           
           <div className="flex flex-col sm:flex-row gap-3 md:gap-4 pt-4">
-             <Button variant="secondary" className="w-full h-12 md:h-10" onClick={() => { setIsEditProfileModalOpen(false); setEditedUser({}); }}>Bekor qilish</Button>
+             <Button variant="secondary" className="w-full h-12 md:h-10" onClick={() => { setIsEditProfileModalOpen(false); setEditedUser({}); setTempFileBase64(null); }}>Bekor qilish</Button>
              <Button className="w-full h-12 md:h-10" onClick={handleUpdateProfile}>Saqlash</Button>
           </div>
         </div>
@@ -1322,6 +1618,36 @@ const App = () => {
         .animate-in {
           animation-duration: 300ms;
           animation-fill-mode: both;
+        }
+        
+        .slide-in-from-bottom-8 {
+          animation: slideInFromBottom 300ms ease-out;
+        }
+        
+        .slide-in-from-bottom-12 {
+          animation: slideInFromBottom12 500ms ease-out;
+        }
+        
+        @keyframes slideInFromBottom {
+          from {
+            transform: translateY(2rem);
+            opacity: 0;
+          }
+          to {
+            transform: translateY(0);
+            opacity: 1;
+          }
+        }
+        
+        @keyframes slideInFromBottom12 {
+          from {
+            transform: translateY(3rem);
+            opacity: 0;
+          }
+          to {
+            transform: translateY(0);
+            opacity: 1;
+          }
         }
       `}</style>
     </div>
